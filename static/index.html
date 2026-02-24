@@ -1,0 +1,433 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Harmony</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family: Inter, system-ui, sans-serif;
+      }
+      body {
+        margin: 0;
+        background: #111827;
+        color: #e5e7eb;
+      }
+      .layout {
+        max-width: 1080px;
+        margin: 0 auto;
+        padding: 24px;
+      }
+      .panel {
+        background: #1f2937;
+        border-radius: 12px;
+        padding: 16px;
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+      }
+      .row {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+      }
+      input,
+      button {
+        border-radius: 8px;
+        border: none;
+        padding: 10px 12px;
+        font: inherit;
+      }
+      input {
+        background: #374151;
+        color: #f9fafb;
+      }
+      button {
+        background: #6366f1;
+        color: white;
+        cursor: pointer;
+      }
+      #messages {
+        margin-top: 14px;
+        min-height: 220px;
+        max-height: 320px;
+        overflow: auto;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+      .msg {
+        padding: 8px 10px;
+        border-radius: 8px;
+        background: #374151;
+      }
+      .meta {
+        font-size: 0.75rem;
+        opacity: 0.75;
+      }
+      .system {
+        background: #4338ca;
+      }
+      #chatForm,
+      #mediaControls {
+        margin-top: 10px;
+      }
+      #chatInput {
+        flex: 1;
+      }
+      #remoteMedia {
+        margin-top: 14px;
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+        gap: 10px;
+      }
+      .peer {
+        padding: 10px;
+        border-radius: 10px;
+        background: #111827;
+      }
+      video {
+        width: 100%;
+        border-radius: 8px;
+        background: #000;
+      }
+      .hidden {
+        display: none;
+      }
+      .status {
+        opacity: 0.8;
+        font-size: 0.9rem;
+      }
+    </style>
+  </head>
+  <body>
+    <main class="layout">
+      <h1>Harmony</h1>
+      <p>Self-hosted chat + voice + screen sharing for small communities (5-10 users).</p>
+      <section class="panel">
+        <form id="connectForm" class="row">
+          <input id="username" placeholder="Username" maxlength="32" required />
+          <input id="room" placeholder="Room" value="general" maxlength="32" required />
+          <button type="submit">Connect</button>
+        </form>
+        <p id="status" class="status">Disconnected</p>
+
+        <div id="messages"></div>
+
+        <form id="chatForm" class="row hidden">
+          <input id="chatInput" placeholder="Send a message" maxlength="500" />
+          <button type="submit">Send</button>
+        </form>
+
+        <div id="mediaControls" class="row hidden">
+          <button id="startVoice" type="button">Start Voice</button>
+          <button id="stopVoice" type="button">Stop Voice</button>
+          <button id="startScreen" type="button">Share Screen + Audio</button>
+          <button id="stopScreen" type="button">Stop Sharing</button>
+        </div>
+
+        <video id="localPreview" autoplay muted playsinline class="hidden"></video>
+        <div id="remoteMedia"></div>
+      </section>
+    </main>
+
+    <script>
+      const rtcConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+      const connectForm = document.getElementById('connectForm');
+      const chatForm = document.getElementById('chatForm');
+      const messages = document.getElementById('messages');
+      const chatInput = document.getElementById('chatInput');
+      const statusText = document.getElementById('status');
+      const mediaControls = document.getElementById('mediaControls');
+      const localPreview = document.getElementById('localPreview');
+      const remoteMedia = document.getElementById('remoteMedia');
+
+      const startVoiceButton = document.getElementById('startVoice');
+      const stopVoiceButton = document.getElementById('stopVoice');
+      const startScreenButton = document.getElementById('startScreen');
+      const stopScreenButton = document.getElementById('stopScreen');
+
+      let socket = null;
+      let selfId = null;
+      let localAudioStream = null;
+      let localScreenStream = null;
+      const peers = new Map();
+
+      const addMessage = (event) => {
+        const container = document.createElement('div');
+        container.className = `msg ${event.type === 'system' ? 'system' : ''}`;
+
+        const body = document.createElement('div');
+        body.textContent = `[${event.room}] ${event.username}: ${event.message}`;
+
+        const meta = document.createElement('div');
+        meta.className = 'meta';
+        meta.textContent = new Date(event.timestamp).toLocaleTimeString();
+
+        container.append(body, meta);
+        messages.append(container);
+        messages.scrollTop = messages.scrollHeight;
+      };
+
+      const updateStatus = (text) => {
+        statusText.textContent = text;
+      };
+
+      const sendSignal = (to, data) => {
+        if (!socket || socket.readyState !== WebSocket.OPEN) {
+          return;
+        }
+        socket.send(JSON.stringify({ type: 'signal', to, data }));
+      };
+
+      const getPeerContainer = (peerId, username) => {
+        let block = document.getElementById(`peer-${peerId}`);
+        if (!block) {
+          block = document.createElement('div');
+          block.id = `peer-${peerId}`;
+          block.className = 'peer';
+          block.innerHTML = `<strong>${username}</strong><div class="status">Connected</div>`;
+          remoteMedia.append(block);
+        }
+        return block;
+      };
+
+      const addRemoteTrack = (peerId, username, track, stream) => {
+        const container = getPeerContainer(peerId, username);
+        const existing = container.querySelector(`[data-stream-id="${stream.id}"]`);
+        if (existing) {
+          return;
+        }
+
+        const media = document.createElement(track.kind === 'video' ? 'video' : 'audio');
+        media.dataset.streamId = stream.id;
+        media.autoplay = true;
+        media.playsInline = true;
+        if (track.kind === 'video') {
+          media.controls = true;
+        }
+        media.srcObject = stream;
+        container.append(media);
+      };
+
+      const ensurePeer = (peerId, username) => {
+        if (peers.has(peerId)) {
+          return peers.get(peerId);
+        }
+
+        const pc = new RTCPeerConnection(rtcConfig);
+        const peer = { pc, username, senders: new Map() };
+
+        pc.onicecandidate = (event) => {
+          if (event.candidate) {
+            sendSignal(peerId, { kind: 'ice', candidate: event.candidate });
+          }
+        };
+
+        pc.ontrack = (event) => {
+          addRemoteTrack(peerId, username, event.track, event.streams[0]);
+        };
+
+        peers.set(peerId, peer);
+        getPeerContainer(peerId, username);
+        addLocalTracksToPeer(peer);
+        return peer;
+      };
+
+      const addLocalTracksToPeer = (peer) => {
+        const streams = [localAudioStream, localScreenStream].filter(Boolean);
+        for (const stream of streams) {
+          for (const track of stream.getTracks()) {
+            if (!peer.senders.has(track.id)) {
+              const sender = peer.pc.addTrack(track, stream);
+              peer.senders.set(track.id, sender);
+            }
+          }
+        }
+      };
+
+      const renegotiateWithPeer = async (peerId) => {
+        const peer = peers.get(peerId);
+        if (!peer) {
+          return;
+        }
+
+        addLocalTracksToPeer(peer);
+        const offer = await peer.pc.createOffer();
+        await peer.pc.setLocalDescription(offer);
+        sendSignal(peerId, { kind: 'offer', sdp: peer.pc.localDescription });
+      };
+
+      const closePeer = (peerId) => {
+        const peer = peers.get(peerId);
+        if (!peer) {
+          return;
+        }
+        peer.pc.close();
+        peers.delete(peerId);
+        document.getElementById(`peer-${peerId}`)?.remove();
+      };
+
+      const removeTracksFromPeers = async (trackIds) => {
+        for (const [peerId, peer] of peers.entries()) {
+          for (const trackId of trackIds) {
+            const sender = peer.senders.get(trackId);
+            if (sender) {
+              peer.pc.removeTrack(sender);
+              peer.senders.delete(trackId);
+            }
+          }
+          await renegotiateWithPeer(peerId);
+        }
+      };
+
+      const startVoice = async () => {
+        if (localAudioStream) {
+          return;
+        }
+        localAudioStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        for (const peerId of peers.keys()) {
+          await renegotiateWithPeer(peerId);
+        }
+        updateStatus('Voice chat enabled');
+      };
+
+      const stopVoice = async () => {
+        if (!localAudioStream) {
+          return;
+        }
+        const ids = localAudioStream.getTracks().map((track) => track.id);
+        localAudioStream.getTracks().forEach((track) => track.stop());
+        localAudioStream = null;
+        await removeTracksFromPeers(ids);
+        updateStatus('Voice chat disabled');
+      };
+
+      const stopScreenShare = async () => {
+        if (!localScreenStream) {
+          return;
+        }
+        const ids = localScreenStream.getTracks().map((track) => track.id);
+        localScreenStream.getTracks().forEach((track) => track.stop());
+        localScreenStream = null;
+        localPreview.srcObject = null;
+        localPreview.classList.add('hidden');
+        await removeTracksFromPeers(ids);
+        updateStatus('Screen sharing stopped');
+      };
+
+      const startScreenShare = async () => {
+        if (localScreenStream) {
+          return;
+        }
+        localScreenStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+        const videoTrack = localScreenStream.getVideoTracks()[0];
+        if (videoTrack) {
+          videoTrack.onended = stopScreenShare;
+        }
+        localPreview.srcObject = localScreenStream;
+        localPreview.classList.remove('hidden');
+        for (const peerId of peers.keys()) {
+          await renegotiateWithPeer(peerId);
+        }
+        updateStatus('Screen sharing started (audio included if browser allowed it)');
+      };
+
+      const handleSignal = async (payload) => {
+        const peerId = payload.from;
+        const peer = ensurePeer(peerId, payload.from_username || `peer-${peerId}`);
+        const signal = payload.data || {};
+
+        if (signal.kind === 'offer') {
+          await peer.pc.setRemoteDescription(new RTCSessionDescription(signal.sdp));
+          addLocalTracksToPeer(peer);
+          const answer = await peer.pc.createAnswer();
+          await peer.pc.setLocalDescription(answer);
+          sendSignal(peerId, { kind: 'answer', sdp: peer.pc.localDescription });
+        } else if (signal.kind === 'answer') {
+          await peer.pc.setRemoteDescription(new RTCSessionDescription(signal.sdp));
+        } else if (signal.kind === 'ice' && signal.candidate) {
+          await peer.pc.addIceCandidate(new RTCIceCandidate(signal.candidate));
+        }
+      };
+
+      connectForm.addEventListener('submit', (event) => {
+        event.preventDefault();
+        if (socket) {
+          socket.close();
+        }
+
+        const username = document.getElementById('username').value.trim();
+        const room = document.getElementById('room').value.trim();
+        if (!username || !room) {
+          return;
+        }
+
+        const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
+        socket = new WebSocket(`${protocol}://${location.host}/ws?username=${encodeURIComponent(username)}&room=${encodeURIComponent(room)}`);
+
+        socket.onopen = () => {
+          chatForm.classList.remove('hidden');
+          mediaControls.classList.remove('hidden');
+          updateStatus(`Connected to #${room}`);
+          chatInput.focus();
+        };
+
+        socket.onmessage = async (message) => {
+          const payload = JSON.parse(message.data);
+          if (payload.type === 'welcome') {
+            selfId = payload.self_id;
+            for (const peer of payload.peers || []) {
+              ensurePeer(peer.id, peer.username);
+              await renegotiateWithPeer(peer.id);
+            }
+            return;
+          }
+          if (payload.type === 'user_joined') {
+            ensurePeer(payload.id, payload.username);
+            return;
+          }
+          if (payload.type === 'user_left') {
+            closePeer(payload.id);
+            return;
+          }
+          if (payload.type === 'signal' && payload.from !== selfId) {
+            await handleSignal(payload);
+            return;
+          }
+          addMessage(payload);
+        };
+
+        socket.onclose = async () => {
+          chatForm.classList.add('hidden');
+          mediaControls.classList.add('hidden');
+          updateStatus('Disconnected');
+          for (const peerId of peers.keys()) {
+            closePeer(peerId);
+          }
+          await stopVoice();
+          await stopScreenShare();
+        };
+      });
+
+      chatForm.addEventListener('submit', (event) => {
+        event.preventDefault();
+        if (!socket || socket.readyState !== WebSocket.OPEN) {
+          return;
+        }
+
+        const text = chatInput.value.trim();
+        if (!text) {
+          return;
+        }
+
+        socket.send(JSON.stringify({ type: 'chat', message: text }));
+        chatInput.value = '';
+      });
+
+      startVoiceButton.addEventListener('click', () => startVoice().catch((error) => updateStatus(`Voice error: ${error.message}`)));
+      stopVoiceButton.addEventListener('click', () => stopVoice().catch((error) => updateStatus(`Voice error: ${error.message}`)));
+      startScreenButton.addEventListener('click', () => startScreenShare().catch((error) => updateStatus(`Share error: ${error.message}`)));
+      stopScreenButton.addEventListener('click', () => stopScreenShare().catch((error) => updateStatus(`Share error: ${error.message}`)));
+    </script>
+  </body>
+</html>
